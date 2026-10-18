@@ -1,0 +1,11 @@
+# Python 3.12 / CUDA 12.8 runtime. Torch is supplied by the pinned RunPod
+# PyTorch image; these are the pinned direct dependencies.
+diffusers @ git+https://github.com/huggingface/diffusers.git@d961a388fd02e4db38d17350c8dd9b8abe642e05
+transformers==5.19.0
+accelerate==1.15.0
+huggingface-hub==1.33.0
+peft==0.21.2
+safetensors==0.8.0
+sentencepiece==0.2.2
+pillow==11.0.0
+
