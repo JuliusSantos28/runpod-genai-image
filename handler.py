@@ -10,6 +10,7 @@ Input:
 Output: {"image": base64 PNG, "similarity", "face_fraction", "faces", "seconds", "model_snapshot", "gpu"}
 """
 import base64
+import hashlib
 import io
 import os
 import time
@@ -24,7 +25,10 @@ MODEL_ID = os.environ.get('MODEL_ID', 'Qwen/Qwen-Image-Edit-2511')
 CACHE = Path('/runpod-volume/huggingface-cache/hub')
 ADAPTER = ('fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA', 'qwen-image-edit-2511-multiple-angles-lora.safetensors',
            'e3066224ab74263f4a5b6179cd1a3b0a15577e44')
-PIPE, SNAPSHOT, FACE_APP, ADAPTER_LOADED = None, None, None, False
+UNCHAINED_LORA = ('Sentinel7/flux2', '2348977/2753532/KLEIN-Unchained-V2.safetensors',
+                  '3375b906a95cc4b4853ccee35318975dd4c5ca68',
+                  'bcf84b6b72ccef01f6e36565bd8b69ce8513907e80204476cb3e42098b453341')
+PIPE, SNAPSHOT, FACE_APP, ADAPTER_LOADED, UNCHAINED_LOADED = None, None, None, False, False
 
 
 def snapshot():
@@ -62,6 +66,36 @@ def use_adapter(p, scale):
     p.set_adapters('camera', adapter_weights=float(scale))
 
 
+def use_unchained_lora(p, spec):
+    """Load the pinned Klein 9B Base LoRA on opt-in; disable it on later requests that omit it."""
+    global UNCHAINED_LOADED
+    if not spec:
+        if UNCHAINED_LOADED:
+            p.set_adapters('unchained-v2', adapter_weights=0.0)
+        return
+    if PIPELINE != 'klein' or MODEL_ID != 'black-forest-labs/FLUX.2-klein-base-9B':
+        raise ValueError('Unchained XXX v2 requires the FLUX.2 Klein Base 9B endpoint.')
+    if spec.get('id') != 'unchained-v2':
+        raise ValueError('Unknown external LoRA id.')
+    strength = float(spec.get('strength', 0.8))
+    if not 0.0 <= strength <= 2.0:
+        raise ValueError('LoRA strength must be between 0 and 2.')
+    if not UNCHAINED_LOADED:
+        from huggingface_hub import hf_hub_download
+        repo, filename, revision, expected_sha256 = UNCHAINED_LORA
+        path = hf_hub_download(repo, filename, revision=revision, cache_dir='/tmp/hf')
+        digest_hash = hashlib.sha256()
+        with Path(path).open('rb') as f:
+            for block in iter(lambda: f.read(1 << 20), b''):
+                digest_hash.update(block)
+        digest = digest_hash.hexdigest()
+        if digest != expected_sha256:
+            raise ValueError(f'Pinned LoRA checksum mismatch: {digest}')
+        p.load_lora_weights(path, adapter_name='unchained-v2')
+        UNCHAINED_LOADED = True
+    p.set_adapters('unchained-v2', adapter_weights=strength)
+
+
 def decode(b64):
     return Image.open(io.BytesIO(base64.b64decode(b64))).convert('RGB')
 
@@ -94,6 +128,8 @@ def handler(job):
     p = pipe()
     if PIPELINE != 'klein':
         use_adapter(p, float(a.get('lora_scale', 0)))
+    else:
+        use_unchained_lora(p, a.get('unchained_lora'))
     src = decode(a['image'])
     if a.get('flip'):
         src = src.transpose(Image.FLIP_LEFT_RIGHT)
