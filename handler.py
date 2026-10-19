@@ -7,6 +7,7 @@ Input:
   prompt           text, used as given (camera_prompt is prepended only when set)
   negative, seed, steps, true_cfg_scale, guidance, flip, camera_prompt, lora_scale, width, height (optional)
   score_reference  optional base64 image: cosine similarity of the largest face to it is returned
+  identity_lora   optional {id: "creator1-identity-9b", strength}: private, endpoint-pinned identity LoRA
 Output: {"image": base64 PNG, "similarity", "face_fraction", "faces", "seconds", "model_snapshot", "gpu"}
 """
 import base64
@@ -28,7 +29,8 @@ ADAPTER = ('fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA', 'qwen-image-edit-251
 UNCHAINED_LORA = ('Sentinel7/flux2', '2348977/2753532/KLEIN-Unchained-V2.safetensors',
                   '3375b906a95cc4b4853ccee35318975dd4c5ca68',
                   'bcf84b6b72ccef01f6e36565bd8b69ce8513907e80204476cb3e42098b453341')
-PIPE, SNAPSHOT, FACE_APP, ADAPTER_LOADED, UNCHAINED_LOADED = None, None, None, False, False
+PIPE, SNAPSHOT, FACE_APP, ADAPTER_LOADED = None, None, None, False
+KLEIN_LOADED_ADAPTERS = set()
 
 
 def snapshot():
@@ -66,34 +68,63 @@ def use_adapter(p, scale):
     p.set_adapters('camera', adapter_weights=float(scale))
 
 
-def use_unchained_lora(p, spec):
-    """Load the pinned Klein 9B Base LoRA on opt-in; disable it on later requests that omit it."""
-    global UNCHAINED_LOADED
-    if not spec:
-        if UNCHAINED_LOADED:
-            p.set_adapters('unchained-v2', adapter_weights=0.0)
+def checked_lora(path, expected_sha256):
+    digest_hash = hashlib.sha256()
+    with Path(path).open('rb') as f:
+        for block in iter(lambda: f.read(1 << 20), b''):
+            digest_hash.update(block)
+    if digest_hash.hexdigest() != expected_sha256:
+        raise ValueError('Pinned LoRA checksum mismatch.')
+    return path
+
+
+def load_klein_lora(p, adapter_name, repo, filename, revision, expected_sha256, token=None):
+    if adapter_name in KLEIN_LOADED_ADAPTERS:
         return
-    if PIPELINE != 'klein' or MODEL_ID != 'black-forest-labs/FLUX.2-klein-base-9B':
-        raise ValueError('Unchained XXX v2 requires the FLUX.2 Klein Base 9B endpoint.')
-    if spec.get('id') != 'unchained-v2':
-        raise ValueError('Unknown external LoRA id.')
-    strength = float(spec.get('strength', 0.8))
-    if not 0.0 <= strength <= 2.0:
-        raise ValueError('LoRA strength must be between 0 and 2.')
-    if not UNCHAINED_LOADED:
-        from huggingface_hub import hf_hub_download
-        repo, filename, revision, expected_sha256 = UNCHAINED_LORA
-        path = hf_hub_download(repo, filename, revision=revision, cache_dir='/tmp/hf')
-        digest_hash = hashlib.sha256()
-        with Path(path).open('rb') as f:
-            for block in iter(lambda: f.read(1 << 20), b''):
-                digest_hash.update(block)
-        digest = digest_hash.hexdigest()
-        if digest != expected_sha256:
-            raise ValueError(f'Pinned LoRA checksum mismatch: {digest}')
-        p.load_lora_weights(path, adapter_name='unchained-v2')
-        UNCHAINED_LOADED = True
-    p.set_adapters('unchained-v2', adapter_weights=strength)
+    from huggingface_hub import hf_hub_download
+    path = hf_hub_download(repo, filename, revision=revision, cache_dir='/tmp/hf', token=token)
+    p.load_lora_weights(checked_lora(path, expected_sha256), adapter_name=adapter_name)
+    KLEIN_LOADED_ADAPTERS.add(adapter_name)
+
+
+def use_klein_adapters(p, identity_spec, unchained_spec):
+    """Load pinned Klein adapters on demand, then set all adapter weights per request."""
+    if identity_spec or unchained_spec:
+        if PIPELINE != 'klein' or MODEL_ID != 'black-forest-labs/FLUX.2-klein-base-9B':
+            raise ValueError('Creator1 identity and Unchained LoRAs require the FLUX.2 Klein Base 9B endpoint.')
+
+    active = {}
+    if identity_spec:
+        if identity_spec.get('id') != 'creator1-identity-9b':
+            raise ValueError('Unknown Creator1 identity LoRA id.')
+        strength = float(identity_spec.get('strength', 0.8))
+        if not 0.0 <= strength <= 2.0:
+            raise ValueError('Creator1 identity LoRA strength must be between 0 and 2.')
+        repo = os.environ.get('CREATOR1_IDENTITY_LORA_REPO', '')
+        filename = os.environ.get('CREATOR1_IDENTITY_LORA_FILE', '')
+        revision = os.environ.get('CREATOR1_IDENTITY_LORA_REVISION', '')
+        expected = os.environ.get('CREATOR1_IDENTITY_LORA_SHA256', '')
+        if not all((repo, filename, revision)) or len(expected) != 64:
+            raise RuntimeError('Creator1 identity LoRA is not configured on this endpoint.')
+        token = os.environ.get('HF_TOKEN')
+        if not token:
+            raise RuntimeError('HF_TOKEN is missing from the endpoint environment.')
+        load_klein_lora(p, 'creator1-identity-9b', repo, filename, revision, expected, token)
+        active['creator1-identity-9b'] = strength
+
+    if unchained_spec:
+        if unchained_spec.get('id') != 'unchained-v2':
+            raise ValueError('Unknown external LoRA id.')
+        strength = float(unchained_spec.get('strength', 0.8))
+        if not 0.0 <= strength <= 2.0:
+            raise ValueError('LoRA strength must be between 0 and 2.')
+        repo, filename, revision, expected = UNCHAINED_LORA
+        load_klein_lora(p, 'unchained-v2', repo, filename, revision, expected)
+        active['unchained-v2'] = strength
+
+    if KLEIN_LOADED_ADAPTERS:
+        names = sorted(KLEIN_LOADED_ADAPTERS)
+        p.set_adapters(names, adapter_weights=[active.get(name, 0.0) for name in names])
 
 
 def decode(b64):
@@ -129,7 +160,7 @@ def handler(job):
     if PIPELINE != 'klein':
         use_adapter(p, float(a.get('lora_scale', 0)))
     else:
-        use_unchained_lora(p, a.get('unchained_lora'))
+        use_klein_adapters(p, a.get('identity_lora'), a.get('unchained_lora'))
     src = decode(a['image'])
     if a.get('flip'):
         src = src.transpose(Image.FLIP_LEFT_RIGHT)
