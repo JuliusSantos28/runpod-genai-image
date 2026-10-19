@@ -9,7 +9,7 @@ rented GPU pod starts ready instead of spending ~20 minutes on `pip install`:
 - [ostris/ai-toolkit](https://github.com/ostris/ai-toolkit) at a pinned commit, in `/opt/train-venv`
 - Hugging Face Diffusers / Transformers (pinned versions in `requirements-qwen.txt`), in `/opt/qwen-venv`
 - InsightFace with its public `buffalo_l` model files
-- `handler.py`: a generic RunPod serverless worker for Qwen-Image-Edit-2511 edits (weights come from RunPod's
+- `handler.py`: a generic RunPod serverless worker for Qwen-Image-Edit-2511 or FLUX.2 Klein edits (weights come from RunPod's
   cached-model mount; images are sent with each request)
 
 GitHub Actions builds it on each push to `main` and publishes `ghcr.io/juliussantos28/runpod-genai`
