@@ -5,7 +5,7 @@ Input:
   image            base64 PNG/JPEG to edit (picture 1)
   extra_images     list of base64 images (picture 2, 3)
   prompt           text, used as given (camera_prompt is prepended only when set)
-  negative, seed, steps, true_cfg_scale, guidance, flip, camera_prompt, lora_scale
+  negative, seed, steps, true_cfg_scale, guidance, flip, camera_prompt, lora_scale, width, height (optional)
   score_reference  optional base64 image: cosine similarity of the largest face to it is returned
 Output: {"image": base64 PNG, "similarity", "face_fraction", "faces", "seconds", "model_snapshot", "gpu"}
 """
@@ -100,7 +100,9 @@ def handler(job):
     out = p(image=images, prompt=prompt, negative_prompt=a.get('negative', ' '),
             generator=torch.Generator('cuda').manual_seed(int(a.get('seed', 0))),
             true_cfg_scale=float(a.get('true_cfg_scale', 4.0)), guidance_scale=float(a.get('guidance', 1.0)),
-            num_inference_steps=int(a.get('steps', 40)), num_images_per_prompt=1).images[0]
+            num_inference_steps=int(a.get('steps', 40)), num_images_per_prompt=1,
+            **({'width': int(a['width']) // 16 * 16, 'height': int(a['height']) // 16 * 16}
+               if a.get('width') and a.get('height') else {})).images[0]
     if a.get('flip'):
         out = out.transpose(Image.FLIP_LEFT_RIGHT)
     buf = io.BytesIO()
