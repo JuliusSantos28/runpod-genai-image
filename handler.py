@@ -8,12 +8,15 @@ Input:
   negative, seed, steps, true_cfg_scale, guidance, flip, camera_prompt, lora_scale, width, height (optional)
   score_reference  optional base64 image: cosine similarity of the largest face to it is returned
   identity_lora   optional {id: "creator1-identity-9b", strength}: private, endpoint-pinned identity LoRA
+  loras           optional list of {repo_id, filename, revision, sha256, strength, private}: any LoRA for this
+                  endpoint's model, downloaded from Hugging Face at that exact revision and checked against sha256
 Output: {"image": base64 PNG, "similarity", "face_fraction", "faces", "seconds", "model_snapshot", "gpu"}
 """
 import base64
 import hashlib
 import io
 import os
+import re
 import time
 from pathlib import Path
 
@@ -56,16 +59,39 @@ def pipe():
     return PIPE
 
 
-def use_adapter(p, scale):
+def use_adapter(p, scale, extra=None):
+    """Qwen: the camera-angle adapter (lora_scale) plus any requested LoRAs, all set in one call."""
     global ADAPTER_LOADED
-    if scale <= 0 and not ADAPTER_LOADED:
-        return
-    if not ADAPTER_LOADED:
+    extra = extra or {}
+    if scale > 0 and not ADAPTER_LOADED:
         from huggingface_hub import hf_hub_download
         repo, name, rev = ADAPTER
         p.load_lora_weights(hf_hub_download(repo, name, revision=rev, cache_dir='/tmp/hf'), adapter_name='camera')
         ADAPTER_LOADED = True
-    p.set_adapters('camera', adapter_weights=float(scale))
+    names = (['camera'] if ADAPTER_LOADED else []) + sorted(KLEIN_LOADED_ADAPTERS)
+    if names:
+        weights = {'camera': float(scale), **extra}
+        p.set_adapters(names, adapter_weights=[weights.get(n, 0.0) for n in names])
+
+
+def requested_loras(p, specs):
+    """Load any pinned LoRAs from the request (checksum-verified) and return {adapter_name: strength}."""
+    active = {}
+    for spec in specs or []:
+        repo, filename = str(spec.get('repo_id', '')), str(spec.get('filename', ''))
+        revision, expected = str(spec.get('revision', '')), str(spec.get('sha256', '')).lower()
+        if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo) or not filename.endswith('.safetensors'):
+            raise ValueError('Each LoRA needs a Hugging Face repo_id and a .safetensors filename.')
+        if not re.fullmatch(r'[0-9a-f]{40}', revision) or not re.fullmatch(r'[0-9a-f]{64}', expected):
+            raise ValueError('Each LoRA needs an exact 40-character revision and its SHA-256.')
+        strength = float(spec.get('strength', 1.0))
+        if not -2.0 <= strength <= 2.0:
+            raise ValueError('LoRA strength must be between -2 and 2.')
+        name = 'u' + expected[:16]
+        token = os.environ.get('HF_TOKEN') if spec.get('private') else None
+        load_klein_lora(p, name, repo, filename, revision, expected, token)
+        active[name] = strength
+    return active
 
 
 def checked_lora(path, expected_sha256):
@@ -87,13 +113,13 @@ def load_klein_lora(p, adapter_name, repo, filename, revision, expected_sha256, 
     KLEIN_LOADED_ADAPTERS.add(adapter_name)
 
 
-def use_klein_adapters(p, identity_spec, unchained_spec):
+def use_klein_adapters(p, identity_spec, unchained_spec, extra=None):
     """Load pinned Klein adapters on demand, then set all adapter weights per request."""
     if identity_spec or unchained_spec:
         if PIPELINE != 'klein' or MODEL_ID != 'black-forest-labs/FLUX.2-klein-base-9B':
             raise ValueError('Creator1 identity and Unchained LoRAs require the FLUX.2 Klein Base 9B endpoint.')
 
-    active = {}
+    active = dict(extra or {})
     if identity_spec:
         if identity_spec.get('id') != 'creator1-identity-9b':
             raise ValueError('Unknown Creator1 identity LoRA id.')
@@ -157,10 +183,11 @@ def handler(job):
     a = job['input']
     t0 = time.monotonic()
     p = pipe()
+    extra = requested_loras(p, a.get('loras'))
     if PIPELINE != 'klein':
-        use_adapter(p, float(a.get('lora_scale', 0)))
+        use_adapter(p, float(a.get('lora_scale', 0)), extra)
     else:
-        use_klein_adapters(p, a.get('identity_lora'), a.get('unchained_lora'))
+        use_klein_adapters(p, a.get('identity_lora'), a.get('unchained_lora'), extra)
     src = decode(a['image'])
     if a.get('flip'):
         src = src.transpose(Image.FLIP_LEFT_RIGHT)
@@ -181,7 +208,8 @@ def handler(job):
     buf = io.BytesIO()
     out.save(buf, 'PNG')
     result = {'image': base64.b64encode(buf.getvalue()).decode(), 'full_prompt': prompt,
-              'model_snapshot': SNAPSHOT.name, 'gpu': torch.cuda.get_device_name(0), 'dimensions': list(out.size)}
+              'model_snapshot': SNAPSHOT.name, 'gpu': torch.cuda.get_device_name(0), 'dimensions': list(out.size),
+              'loras_applied': extra}
     if a.get('score_reference'):
         result['similarity'], result['face_fraction'], result['faces'] = face_similarity(out, decode(a['score_reference']))
     result['seconds'] = round(time.monotonic() - t0, 2)
