@@ -24,7 +24,7 @@ import runpod
 import torch
 from PIL import Image
 
-PIPELINE = os.environ.get('PIPELINE', 'qwen')  # 'klein' runs a FLUX.2 Klein model (MODEL_ID) with reference images
+PIPELINE = os.environ.get('PIPELINE', 'qwen')  # 'klein': FLUX.2 Klein with reference images; 'krea2': Krea 2, text only
 MODEL_ID = os.environ.get('MODEL_ID', 'Qwen/Qwen-Image-Edit-2511')
 CACHE = Path('/runpod-volume/huggingface-cache/hub')
 ADAPTER = ('fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA', 'qwen-image-edit-2511-multiple-angles-lora.safetensors',
@@ -52,7 +52,8 @@ def pipe():
     global PIPE, SNAPSHOT
     if PIPE is None:
         import diffusers
-        cls = diffusers.Flux2KleinPipeline if PIPELINE == 'klein' else diffusers.QwenImageEditPlusPipeline
+        cls = {'klein': diffusers.Flux2KleinPipeline, 'krea2': diffusers.Krea2Pipeline}.get(
+            PIPELINE, diffusers.QwenImageEditPlusPipeline)
         SNAPSHOT = snapshot()
         PIPE = cls.from_pretrained(str(SNAPSHOT), torch_dtype=torch.bfloat16, local_files_only=True).to('cuda')
         PIPE.set_progress_bar_config(disable=True)
@@ -184,26 +185,32 @@ def handler(job):
     t0 = time.monotonic()
     p = pipe()
     extra = requested_loras(p, a.get('loras'))
-    if PIPELINE != 'klein':
+    if PIPELINE == 'qwen' or PIPELINE not in ('klein', 'krea2'):
         use_adapter(p, float(a.get('lora_scale', 0)), extra)
     else:
         use_klein_adapters(p, a.get('identity_lora'), a.get('unchained_lora'), extra)
-    src = decode(a['image'])
-    if a.get('flip'):
-        src = src.transpose(Image.FLIP_LEFT_RIGHT)
-    images = [src] + [decode(x) for x in a.get('extra_images', [])]
+    images = []
+    if PIPELINE != 'krea2':  # Krea 2 is text-to-image only: no reference pictures
+        src = decode(a['image'])
+        if a.get('flip'):
+            src = src.transpose(Image.FLIP_LEFT_RIGHT)
+        images = [src] + [decode(x) for x in a.get('extra_images', [])]
     prompt = f"{a['camera_prompt']}. {a['prompt']}" if a.get('camera_prompt') else a['prompt']
     size = ({'width': int(a['width']) // 16 * 16, 'height': int(a['height']) // 16 * 16}
             if a.get('width') and a.get('height') else {})
     gen = torch.Generator('cuda').manual_seed(int(a.get('seed', 0)))
-    if PIPELINE == 'klein':
+    if PIPELINE == 'krea2':  # Turbo: 8 steps, guidance 0 (Raw: about 52 steps, guidance 3.5)
+        out = p(prompt=prompt, negative_prompt=a.get('negative') or None, generator=gen,
+                guidance_scale=float(a.get('guidance', 0.0)), num_inference_steps=int(a.get('steps', 8)),
+                **size).images[0]
+    elif PIPELINE == 'klein':
         out = p(image=images, prompt=prompt, generator=gen, guidance_scale=float(a.get('guidance', 1.0)),
                 num_inference_steps=int(a.get('steps', 4)), **size).images[0]
     else:
         out = p(image=images, prompt=prompt, negative_prompt=a.get('negative', ' '), generator=gen,
                 true_cfg_scale=float(a.get('true_cfg_scale', 4.0)), guidance_scale=float(a.get('guidance', 1.0)),
                 num_inference_steps=int(a.get('steps', 40)), num_images_per_prompt=1, **size).images[0]
-    if a.get('flip'):
+    if a.get('flip') and images:
         out = out.transpose(Image.FLIP_LEFT_RIGHT)
     buf = io.BytesIO()
     out.save(buf, 'PNG')
