@@ -43,9 +43,14 @@ def snapshot():
     if want and (root / want).is_dir():
         return root / want
     snaps = sorted(root.glob('*')) if root.is_dir() else []
-    if not snaps:
-        raise RuntimeError(f'{MODEL_ID} is not in the cached-model mount; set it as the endpoint model')
-    return snaps[0]
+    if snaps:
+        return snaps[0]
+    if os.environ.get('MODEL_DOWNLOAD') == '1':  # no cached-model mount: fetch the diffusers files at start-up
+        from huggingface_hub import snapshot_download
+        skip = [x for x in os.environ.get('MODEL_DOWNLOAD_SKIP', '').split(',') if x]
+        return Path(snapshot_download(MODEL_ID, revision=want or None, token=os.environ.get('HF_TOKEN'),
+                                      cache_dir='/tmp/hf-models', ignore_patterns=skip or None))
+    raise RuntimeError(f'{MODEL_ID} is not in the cached-model mount; set it as the endpoint model')
 
 
 def pipe():
